@@ -22,6 +22,11 @@
 #include <time.h>
 #ifdef WIN32
 #include <windows.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #endif
 #include "builtin.h"
 #include "compile.h"
@@ -1874,6 +1879,143 @@ static jv f_have_decnum(jq_state *jq, jv a) {
 #endif
 }
 
+#ifdef WIN32
+static jv f_exec(jq_state *jq, jv input) {
+  jv_free(input);
+  return jv_invalid_with_msg(jv_string("exec is not supported on Windows"));
+}
+#else
+static jv f_exec(jq_state *jq, jv input) {
+  if (jv_get_kind(input) != JV_KIND_ARRAY) {
+    return type_error(input, "exec requires an array of command arguments");
+  }
+  
+  int array_len = jv_array_length(jv_copy(input));
+  if (array_len == 0) {
+    jv_free(input);
+    return jv_invalid_with_msg(jv_string("exec requires a non-empty array"));
+  }
+  
+  // Convert jv array to argv array
+  char **argv = malloc((array_len + 1) * sizeof(char*));
+  if (!argv) {
+    jv_free(input);
+    return jv_invalid_with_msg(jv_string("exec: memory allocation failed"));
+  }
+  
+  for (int i = 0; i < array_len; i++) {
+    jv arg = jv_array_get(jv_copy(input), i);
+    if (jv_get_kind(arg) != JV_KIND_STRING) {
+      // Clean up allocated memory
+      for (int j = 0; j < i; j++) {
+        free(argv[j]);
+      }
+      free(argv);
+      jv_free(arg);
+      jv_free(input);
+      return jv_invalid_with_msg(jv_string("exec: all arguments must be strings"));
+    }
+    
+    const char *arg_str = jv_string_value(arg);
+    argv[i] = strdup(arg_str);
+    if (!argv[i]) {
+      // Clean up allocated memory
+      for (int j = 0; j < i; j++) {
+        free(argv[j]);
+      }
+      free(argv);
+      jv_free(arg);
+      jv_free(input);
+      return jv_invalid_with_msg(jv_string("exec: memory allocation failed"));
+    }
+    jv_free(arg);
+  }
+  argv[array_len] = NULL;
+  
+  jv_free(input);
+  
+  // Create pipe for capturing output
+  int pipefd[2];
+  if (pipe(pipefd) == -1) {
+    // Clean up argv
+    for (int i = 0; i < array_len; i++) {
+      free(argv[i]);
+    }
+    free(argv);
+    return jv_invalid_with_msg(jv_string_fmt("exec: pipe creation failed: %s", strerror(errno)));
+  }
+  
+  pid_t pid = fork();
+  if (pid == -1) {
+    // Clean up
+    close(pipefd[0]);
+    close(pipefd[1]);
+    for (int i = 0; i < array_len; i++) {
+      free(argv[i]);
+    }
+    free(argv);
+    return jv_invalid_with_msg(jv_string_fmt("exec: fork failed: %s", strerror(errno)));
+  }
+  
+  if (pid == 0) {
+    // Child process
+    close(pipefd[0]); // Close read end
+    dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
+    dup2(pipefd[1], STDERR_FILENO); // Redirect stderr to pipe
+    close(pipefd[1]);
+    
+    execvp(argv[0], argv);
+    // If execvp returns, it failed
+    _exit(127);
+  }
+  
+  // Parent process
+  close(pipefd[1]); // Close write end
+  
+  // Clean up argv in parent
+  for (int i = 0; i < array_len; i++) {
+    free(argv[i]);
+  }
+  free(argv);
+  
+  // Read output from pipe
+  char buffer[4096];
+  jv output = jv_string("");
+  ssize_t bytes_read;
+  
+  while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+    buffer[bytes_read] = '\0';
+    output = jv_string_append_str(output, buffer);
+  }
+  
+  close(pipefd[0]);
+  
+  // Wait for child process
+  int status;
+  waitpid(pid, &status, 0);
+  
+  // Remove trailing newline if present
+  const char *output_str = jv_string_value(output);
+  int output_len = jv_string_length_bytes(jv_copy(output));
+  if (output_len > 0 && output_str[output_len - 1] == '\n') {
+    jv trimmed = jv_string_sized(output_str, output_len - 1);
+    jv_free(output);
+    output = trimmed;
+  }
+  
+  // Check if output is valid JSON and parse it if so
+  jv result = jv_parse_sized(jv_string_value(output), jv_string_length_bytes(jv_copy(output)));
+  if (jv_is_valid(result)) {
+    jv_free(output);
+    return result;
+  } else {
+    // If not valid JSON, free the parse result and return the string
+    jv_free(result);
+    return output;
+  }
+}
+#endif
+
 #define CFUNC(func, name, arity) \
   {.fptr = { .a ## arity = func }, name, arity}
 
@@ -1960,6 +2102,7 @@ BINOPS
   CFUNC(f_current_line, "input_line_number", 1),
   CFUNC(f_have_decnum, "have_decnum", 1),
   CFUNC(f_have_decnum, "have_literal_numbers", 1),
+  CFUNC(f_exec, "exec", 1),
 };
 #undef LIBM_DDDD_NO
 #undef LIBM_DDD_NO
